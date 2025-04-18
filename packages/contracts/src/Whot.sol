@@ -1,31 +1,48 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity ^0.8.24;
+
+import "fhevm/lib/TFHE.sol";
+import {AsyncHandler} from "./base/AsyncHandler.sol";
 import {IWhotManager} from "./interfaces/IWhotManager.sol";
-import {EIP712WithModifier} from "./abstracts/EIP712WithModifier.sol";
-import "./WhotLib.sol";
+import {
+    GameData,
+    PlayerData,
+    Action,
+    PendingAction,
+    GameStatus,
+    WhotLib
+} from "./libraries/WhotLib.sol";
+import {ConditionalsLib} from "./libraries/ConditionalsLib.sol";
+import {GameCache, GameCacheManager} from "./types/GameCache.sol";
+import {CardShape, WhotCard, WhotCardLib} from "./types/WhotCard.sol";
+import {WhotDeckMap, WhotDeckMapLib} from "./types/WhotDeckMap.sol";
+import {TrustedShuffleService as TSS} from "./TrustedShuffleService.sol";
 
-contract Whot is EIP712WithModifier {
+contract Whot is AsyncHandler {
     using TFHE for *;
-    using WhotLib for *;
+    using ConditionalsLib for *;
 
+    uint256 constant DEFAULT_MAX_DELAY = 7 minutes;
+    // uint256 constant MAX_UINT32 = type(uint32).max;
     // Max number of players in a whot game.
     uint256 constant MAX_PLAYERS = 6;
     // Starting hand size for all players
-    uint256 constant INITIAL_HAND_SIZE = 6;
 
-    // Whot Game Data.
-    mapping(uint256 => WhotLib.GameData) internal whotGame;
-
-    mapping(address => bool) internal specialMovesUnlockedFor;
+    TSS internal tss;
 
     // game ID
-    uint256 gID = 1;
+    uint256 internal whotGameID = 1;
+
+    // Whot Game Data.
+    mapping(uint256 gameID => GameData) internal whotGame;
 
     // ERRORS
     // Player is  trying to join a game that they already joined.
     error PlayerAlreadyInGame();
     // Caller is  trying to join a game that has already started.
     error GameAlreadyStarted();
+    // Caller is trying to join a game that has not started yet.
+    error GameNotStarted();
     // Can only play or execute move when its player's turn.
     error NotPlayerTurn();
     // Player cannot make any move that doesn't resolve a pending action.
@@ -38,425 +55,555 @@ contract Whot is EIP712WithModifier {
     error NoPendingAction();
     // Defense is not enabled.
     error DefenseNotEnabled();
-    // If call card is WHOT card, any card played must match its wish card.
-    error WrongWishCard();
-    // Player is not active. 
-    error PlayerNotActive();
+    // // If call card is WHOT card, any card played must match its wish card.
+    // error WrongWishCard();
+    // // Player is not active.
+    // error PlayerNotActive();
     // Player not proposed by game creator.
     error NotProposedPlayer();
     // Game cant be started.
-    error CantStartGame();
+    error CannotStartGame();
     // Max player limit exceeded
     error PlayersLimitExceeded();
-    // Caller is not part of game
-    error PlayerNotInGame();
-
+    error PlayersLimitNotMet();
+    // // Caller is not part of game
+    // error PlayerNotInGame(address player);
+    // // Card not committed or decrypted.
+    // error WhotCardNotReady();
+    error CannotBootOutPlayer(address player);
+    error InvalidGameAction(Action action);
+    error PlayerAlreadyCommittedAction();
 
     //EVENTS
     // A player forfeited or was booted out by the whot manager.
-    event PlayerForfeited(uint256 indexed gameID, address player);
+    event PlayerForfeited(uint256 indexed gameID, uint256 playerIndex);
     // A player joined a game.
     event PlayerJoined(uint256 indexed gameID, address player);
-    // A player executed a move - WhotLib.Action{..}
-    event MoveExecuted(uint256 indexed gameID, uint8 pTurnIndex, uint8 card, WhotLib.Action action);
+    event PlayerPickTwo(uint256 indexed gameID, uint256 playerIndex, PendingAction action);
+    event PlayerPickThree(uint256 indexed gameID, uint256 playerIndex);
+    // A player executed a move - Action{..}
+    event MoveExecuted(uint256 indexed gameID, uint256 pTurnIndex, Action action);
     // A player will miss their turn.
-    event Suspended(uint256 indexed gameID, uint8 pTurnIndexSuspended);
-    // All players will  miss their next turn.
-    event GameHeld(uint256 indexed gameID);
+    event PlayerSuspended(uint256 indexed gameID, uint256 pTurnIndexSuspended);
+    event PendingActionFulfilled(uint256 indexed gameID, uint256 playerIndex, PendingAction action);
+    // // All players will  miss their next turn.
+    event GameSuspended(uint256 indexed gameID, uint256 currentPlayerIndex);
     // All players deck will be dealt with an extra card.
-    event GeneralMarket(uint256 indexed gameID);
+    event GeneralMarket(uint256 indexed gameID, uint256 playerIndex);
     // New Whot game created.
     event GameCreated(uint256 indexed gameID, address gameCreator);
     // Whot game started.
     event GameStarted(uint256 indexed gameID);
     // Whot game ended.
     event GameEnded(uint256 indexed gameID);
+    // // Card decrypted.
+    // event CardDecrypted(uint256 indexed requestID, WhotCard card);
 
+    event GameActionFailedWithError(uint256 indexed gameID, uint256 pTurnIndex, bytes4 errMsg);
+
+    constructor(address _tss, uint256 _maxCallbackDelay) AsyncHandler(_maxCallbackDelay) {
+        tss = TSS(_tss);
+    }
 
     // Create whot game with max number of players.
     // To enable whot manager, caller has to be a smart cntract that implements `IWhotManager`
     // If array length greater than zero, then only addresses in the array can join the game.
     // If array is empty, then any participants as much as `maxPlayers` can join the game.
-    function createGame(address[] memory proposedPlayers, uint8 maxPlayers) public returns(uint256 gameID){
-        gameID = gID;
-        WhotLib.GameData storage game = whotGame[gameID];
+    function createGame(
+        bytes32[] calldata proof,
+        einput[2] calldata leaf,
+        bytes calldata inputProof,
+        uint256 shuffledCardDeckRootIndex,
+        address[] calldata proposedPlayers,
+        uint256 maxPlayers
+    ) public returns (uint256 gameID) {
+        gameID = whotGameID;
+        GameData storage game = whotGame[gameID];
         // Create new market deck and shuffle.
-        game.marketDeck = WhotLib.getDefaultMarketDeck().shuffleDeck();
+        tss.verifyAndUseShuffledCardDeck(proof, leaf, shuffledCardDeckRootIndex);
+
+        euint256 marketDeck_0 = TFHE.asEuint256(leaf[0], inputProof);
+        game.marketDeck[0] = marketDeck_0;
+
+        euint256 marketDeck_1 = TFHE.asEuint256(leaf[1], inputProof);
+        game.marketDeck[1] = marketDeck_1;
+
+        TFHE.allowThis(marketDeck_0);
+        TFHE.allowThis(marketDeck_1);
+
+        game.initalizeMarketDeckMap();
         game.proposedPlayers = proposedPlayers;
-        game.maxPlayers = proposedPlayers.length > 0 ? uint8(proposedPlayers.length) : maxPlayers;
-        if(game.maxPlayers > MAX_PLAYERS){
-            revert PlayersLimitExceeded();
+        game.gameCreator = msg.sender;
+
+        maxPlayers = proposedPlayers.length != 0 ? proposedPlayers.length : maxPlayers;
+
+        if (maxPlayers > MAX_PLAYERS) revert PlayersLimitExceeded();
+        if (maxPlayers < 2) revert PlayersLimitNotMet();
+
+        game.maxPlayers = uint8(maxPlayers);
+        game.playersLeftToJoin = uint8(maxPlayers);
+
+        unchecked {
+            whotGameID++;
         }
-        // player's index is initially set to its proposed player index.
-        // when shuffling player's index it is then set to its normal player index.
-        for(uint256 i = 0; i < proposedPlayers.length; i++){
-            game.playerIndex[proposedPlayers[i]] = i;
-        }
-        gID++;
 
         emit GameCreated(gameID, game.gameCreator);
     }
 
-    // Allows game creator to create and participate in a game.
-    function createAndJoinGame(address[] memory proposedPlayers, uint8 maxPlayers) external returns(uint256 gameID){
-        gameID = createGame(proposedPlayers, maxPlayers);
-        joinGame(gameID);
-    }
+    // // Allows game creator to create and participate in a game.
+    // function createAndJoinGame(
+    //     bytes32[] calldata proof,
+    //     einput[2] calldata leaf,
+    //     bytes[2] calldata inputProof,
+    //     uint256 shuffledCardDeckRootIndex,
+    //     address[] calldata proposedPlayers,
+    //     uint256 maxPlayers,
+    //     bytes calldata extraData
+    // ) external returns (uint256 gameID) {
+    //     gameID = createGame(
+    //         proof, leaf, inputProof, shuffledCardDeckRootIndex, proposedPlayers, maxPlayers
+    //     );
+    //     joinGame(gameID, extraData);
+    // }
 
     // Joins whot game if game hasn't already started.
-    // Can only join game if player is a proposed player (proposed players has to be set) 
+    // Can only join game if player is a proposed player (proposed players has to be set)
     // or max players limit has not being reached.
-    function joinGame(uint256 gameID) public {
-        WhotLib.GameData storage game = whotGame[gameID];
-        WhotLib.PlayerData memory player;
-        bool isProposedPlayer;
-        if(game.callCard != 0) revert GameAlreadyStarted();
-        if(game.isActive[msg.sender]) revert PlayerAlreadyInGame();
-        if(game.proposedPlayers.length != 0){
-            isProposedPlayer = game.proposedPlayers[game.playerIndex[msg.sender]] == msg.sender;
-        } else {
-            isProposedPlayer = game.playersLeftToJoin != 0;
-        }
-        if(isProposedPlayer){
-            player.playerAddr = msg.sender;
-            game.isActive[msg.sender] = true;
-            game.players.push(player);
-            game.playersLeftToJoin--;
-        } else { revert NotProposedPlayer(); }
+    function joinGame(uint256 gameID, bytes calldata extraData) public {
+        GameData storage game = whotGame[gameID];
 
-        emit PlayerJoined(gameID, msg.sender);
+        (GameCache memory g, uint256 slot) = GameCacheManager.toMem(game);
+
+        if (!g.status.eqs(GameStatus.None)) revert GameAlreadyStarted();
+
+        address playerToAdd = msg.sender;
+
+        if (game.isActive()) revert PlayerAlreadyInGame();
+
+        bool isProposedPlayer =
+            game.proposedPlayers.length != 0 ? game.isProposedPlayer() : g.playersLeftToJoin != 0;
+
+        if (isProposedPlayer) {
+            g.playersLeftToJoin--;
+            game.addPlayer(playerToAdd);
+        } else {
+            revert NotProposedPlayer();
+        }
+
+        g.toStorage(slot);
+
+        // _onJoinGame(gameID, g.gameCreator, playerToAdd, extraData);
+
+        emit PlayerJoined(gameID, playerToAdd);
     }
 
     /// Start a whot game.
     function startGame(uint256 gameID) external {
-        WhotLib.GameData storage game = whotGame[gameID];
-        WhotLib.PlayerData[] memory players = game.players;
-        if(
-            (msg.sender == game.gameCreator && (game.maxPlayers - game.playersLeftToJoin) >= 2) 
-            || game.playersLeftToJoin == 0
-        ){
-            // initial deck size for each player is six.
-            for(uint256 i = 0; i < INITIAL_HAND_SIZE; i++){
-                for(uint256 j = 0; j < players.length; j++){
-                    game.marketDeck.deal(game.players[j].deck);
-                }
+        GameData storage game = whotGame[gameID];
+        PlayerData[] memory players = game.players;
+
+        (GameCache memory g, uint256 slot) = GameCacheManager.toMem(game);
+
+        uint256 playersLeftToJoin = g.playersLeftToJoin;
+        uint256 joined = g.maxPlayers - playersLeftToJoin;
+        address gameCreator = g.gameCreator;
+        bool canStartGame;
+
+        assembly ("memory-safe") {
+            let isGameCreator := eq(caller(), gameCreator)
+            canStartGame := or(iszero(playersLeftToJoin), and(isGameCreator, gt(joined, 1)))
+        }
+
+        if (canStartGame) {
+            for (uint256 i = 0; i < players.length; i++) {
+                PlayerData memory player = players[i];
+                game.setPlayerScoreToMin(i);
+                game.dealInitialHand(player, uint8(i), uint8(joined));
             }
-            // set initial player score to min.
-            // where zero is maximum score and type(uint32).max in minimum score.
-            for(uint256 k = 0; k < players.length; k++){
-                game.score[game.players[k].playerAddr] = type(uint32).max;
-            }
-        } else { revert CantStartGame(); }
+        } else {
+            revert CannotStartGame();
+        }
+
+        g.status = GameStatus.Started;
+        g.toStorage(slot);
 
         // shuffle players array.
         // First player's move is not constrained so might give them slight advantages.
-        shufflePlayers(game);
-        game.started = true;
+        // game.shufflePlayers();
         emit GameStarted(gameID);
     }
 
+    function commitMove(uint256 gameID, Action action, uint8 cardIndex, CardShape wish) external {
+        if (hasCommittedAction(gameID)) revert PlayerAlreadyCommittedAction();
+        GameData storage game = whotGame[gameID];
+        (GameCache memory g,) = GameCacheManager.toMem(game);
+        if (!g.status.eqs(GameStatus.Started)) revert GameNotStarted();
+        // if action not play or defend revert!!!
+
+        uint256 currentTurnIndex = g.playerTurnIndex;
+        PlayerData memory player = game.players[currentTurnIndex];
+
+        if (!player.turn()) revert NotPlayerTurn();
+        if (!action.eqs_or(Action.Play, Action.Defend)) {
+            revert InvalidGameAction(action);
+        }
+
+        euint8 cardToCommit = game.getCardToCommit(player, cardIndex);
+
+        _commitMove(gameID, cardToCommit, action, wish, currentTurnIndex);
+    }
+
     // Execute player's move.
-    function executeMove(
-        uint256 gameID,
-        WhotLib.Action action,
-        uint256 cardIndex,
-        WhotLib.Shape iWishCardShape
-    ) external {
-        WhotLib.GameData storage game = whotGame[gameID];
-        gameStarted(game);
-        isPlayerTurn(game);
-        if(action == WhotLib.Action.Play) play(gameID, game, cardIndex, iWishCardShape);
-        if(action == WhotLib.Action.Defend) defend(gameID, game, cardIndex);
-        if(action == WhotLib.Action.GoToMarket) goToMarket(gameID, game);
-        if(action == WhotLib.Action.Pick) pick(gameID, game);
-        finish(gameID, game);
+    function executeMove(uint256 gameID, Action action) external {
+        GameData storage game = whotGame[gameID];
+        (GameCache memory g,) = GameCacheManager.toMem(game);
+        // check if committed card is ready and ensure it is the player's turn.
+        if (!g.status.eqs(GameStatus.Started)) revert GameNotStarted();
+
+        PlayerData memory player = game.players[g.playerTurnIndex];
+        if (!player.turn()) revert NotPlayerTurn();
+
+        if (hasCommittedAction(gameID)) revert PlayerAlreadyCommittedAction();
+
+        if (action.eqs(Action.GoToMarket)) {
+            goToMarket(gameID, game, g.playerTurnIndex);
+        } else if (action.eqs(Action.Pick)) {
+            pick(gameID, game, g.playerTurnIndex);
+        } else {
+            revert InvalidGameAction(action);
+        }
+
+        // _onExecuteMove(gameID, g.gameCreator, g.playerTurnIndex, action);
+
+        finish(gameID, game, false);
+    }
+
+    function handleCommitMove(uint256 requestID, uint8 card)
+        external
+        virtual
+        override
+        onlyGateway
+    {
+        // revert("Not implemented");
+        CommittedCard memory cc = getCommittedMove(requestID);
+        GameData storage game = whotGame[cc.gameID];
+
+        WhotCard whotCard = WhotCardLib.toWhotCard(card);
+        if (whotCard.iWish()) whotCard = WhotCardLib.makeWhotWish(cc.wishShape);
+
+        (bool err, bytes4 errMsg) = cc.action.eqs(Action.Play)
+            ? play(cc.gameID, game, WhotCardLib.toWhotCard(card), cc.extraData)
+            : defend(cc.gameID, game, WhotCardLib.toWhotCard(card), cc.extraData);
+
+        if (err) {
+            emit GameActionFailedWithError(cc.gameID, cc.playerIndex, errMsg);
+        }
+
+        // if (err) _forfeit(cc.gameID, game, cc.playerIndex);
+        finish(cc.gameID, game, false);
+        clearMoveCommitment(cc.gameID);
+    }
+
+    function handleCommitScore(uint256 requestID, uint128 total)
+        external
+        virtual
+        override
+        onlyGateway
+    {
+        ScoreDecryptData memory sdd = getCommittedScoreData(requestID);
+        GameData storage game = whotGame[sdd.gameID];
+
+        for (uint256 i; i < sdd.playerIndexes.length; i++) {
+            game.setPlayerScore(
+                sdd.playerIndexes[i], uint16((total >> (sdd.playerIndexes[i] * 16)))
+            );
+        }
+
+        _onEndGame(sdd.gameID, game.gameCreator);
     }
 
     /// Fails silently. Might be an anti patern? Todo(nonso): fix?
-    function finish(uint256 gameID, WhotLib.GameData storage game) internal {
-        WhotLib.PlayerData[] memory players = game.players;
+    function finish(uint256 gameID, GameData storage game, bool force) internal {
+        PlayerData[] memory players = game.players;
         uint256 activePlayers;
-        for(uint256 i = 0; i < players.length; i++){
-            if(game.isActive[players[i].playerAddr]){
-                activePlayers++;
-            }
+        for (uint256 i = 0; i < players.length; i++) {
+            if (players[i].isActive) activePlayers++;
         }
-        if(game.marketDeck.isEmpty() || game.players[game.playerTurnIndex].deck.isEmpty() || activePlayers == 1){
-            // calculate active players total score.
-            for(uint256 i = 0; i < players.length; i++){
-                if(game.isActive[players[i].playerAddr]){
-                    game.score[players[i].playerAddr] = game.players[i].deck.total();
-                }
-            }
-            game.ended = true;
-
+        uint256 currentTurnIndex = game.playerTurnIndex;
+        PlayerData memory player = players[currentTurnIndex];
+        bool canFinish = game.marketDeckMap.isMapEmpty() || player.deckMap.isMapEmpty()
+            || activePlayers == 1 || force;
+        if (canFinish) {
+            _calculatePlayersScore(gameID, game, players, activePlayers);
+            game.status = GameStatus.Ended;
             emit GameEnded(gameID);
         }
     }
 
     // Forfeit whot game.
     function forfeit(uint256 gameID) external {
-        WhotLib.GameData storage game = whotGame[gameID];
-        gameStarted(game);
-        _forfeit(gameID, game, msg.sender);
-        finish(gameID, game);
+        GameData storage game = whotGame[gameID];
+        if (!game.status.eqs(GameStatus.Started)) revert GameNotStarted();
+        uint256 index = game.getPlayerIndex(msg.sender);
+        _forfeit(gameID, game, index);
+        finish(gameID, game, false);
     }
 
     // Allows whot manager to remove player from game.
-    function bootOut(uint256 gameID, address player) external {
-        WhotLib.GameData storage game = whotGame[gameID];
-        gameStarted(game);
-        // callback to whot manager.
-        IWhotManager(game.gameCreator).canBootOut();
-        _forfeit(gameID, game, player);
-        finish(gameID, game);
+    function bootOut(uint256 gameID) external {
+        GameData storage game = whotGame[gameID];
+        (GameCache memory g,) = GameCacheManager.toMem(game);
+
+        if (!g.status.eqs(GameStatus.Started)) revert GameNotStarted();
+
+        uint256 index = g.playerTurnIndex;
+        address player = game.players[index].playerAddr;
+
+        if ((g.lastMoveTimestamp + DEFAULT_MAX_DELAY) > block.timestamp) {
+            revert CannotBootOutPlayer(player);
+        }
+
+        _forfeit(gameID, game, index);
+        finish(gameID, game, false);
     }
 
-    function _forfeit(uint256 gameID, WhotLib.GameData storage game, address _player) internal {
-        WhotLib.PlayerData memory player = game.players[game.playerIndex[_player]];
-        // checks edge cases where default mapping is zero which is a valid index.
-        if(player.playerAddr != _player){
-            revert PlayerNotInGame();
+    function _forfeit(uint256 gameID, GameData storage game, uint256 index) internal {
+        game.deactivatePlayer(index);
+        if (game.playerTurnIndex == index) {
+            game.playerTurnIndex = uint8(game.nextIndex(index));
         }
-        if(!game.isActive[_player]){
-            revert PlayerNotActive();
-        }
-        game.isActive[_player] = false;
-        if(player.playerAddr == _player){
-            game.playerTurnIndex = nextIndex(game);
-        }
-        
-        emit PlayerForfeited(gameID, _player);
+
+        emit PlayerForfeited(gameID, index);
     }
 
     // Play whot card.
-    function play(
-        uint256 gameID, 
-        WhotLib.GameData storage game, 
-        uint256 cardIndex, 
-        WhotLib.Shape iWishCardShape
-    ) internal {
-        WhotLib.PlayerData[] memory players = game.players;
-        uint8 currentIndex = game.playerTurnIndex;
-        uint8 card = players[currentIndex].deck[cardIndex].decrypt();
-        uint8 callCard = game.callCard;
-        bool suspension;
-        if(players[currentIndex].pAction != WhotLib.PendingAction.None){
-            revert ResolvePendingAction();
-        }
-        if(card.shape() != whotCardShape()){
-            if(callCard.shape() != whotCardShape()){
-                if(
-                    callCard.shape() != card.shape() 
-                    || callCard.number() != card.number() 
-                    || card.shape() != whotCardShape() 
-                    || callCard != 0
-                ){
-                    revert WrongWhotCard();
-                }
-            } else {
-                if(card.shape() != WhotLib.Shape(callCard & 7)){ revert WrongWishCard(); }
-            }
-            // general market
-            if(card.number() == 14){
-                for(uint256 i = 0; i < players.length; i++){
-                    if(
-                        players[i].playerAddr != players[currentIndex].playerAddr 
-                        && game.isActive[players[i].playerAddr] 
-                        && !game.marketDeck.isEmpty()
-                    ){
-                        game.marketDeck.deal(game.players[i].deck);
-                    }
-                }
-                suspension = true;
-                emit GeneralMarket(gameID);
-            }
-            
-            // pick 2. if card's shape is star and multiplier enabled pick 4
-            if(card.number() == 2){
-                game.players[nextIndex(game)].pAction = (specialMovesUnlocked() && card.shape() == WhotLib.Shape.Star) ?
-                    WhotLib.PendingAction.PickFour : WhotLib.PendingAction.PickTwo;
-            }
-            if(card.number() == 8){
-                suspension = true;
-                emit GameHeld(gameID);
-            }
-            // next player is suspended thus will miss their turn.
-            if(card.number() == 1){
-                suspension = true;
-                suspend(gameID, game);
-            }
-        } else {
-            game.callCard = (card & 0xE0) | uint8(iWishCardShape);
-        }
-        uint256 pDeckLength = players[currentIndex].deck.length;
-        pDeckLength--;
-        if(pDeckLength == cardIndex){
-            game.players[currentIndex].deck.pop();
-        } else {
-            game.players[currentIndex].deck[cardIndex] = players[currentIndex].deck[pDeckLength];
-            game.players[currentIndex].deck.pop();
-        }
-        game.callCard = card;
-        // if there is a suspension no need to update next index.
-        if(!suspension) game.playerTurnIndex = nextIndex(game);
+    // cc.gameID, game, cc.card.toWhotCard(), cc.cardIndex
+    function play(uint256 gameID, GameData storage game, WhotCard card, bytes memory extraData)
+        internal
+        returns (bool err, bytes4 errMsg)
+    {
+        (GameCache memory g, uint256 slot) = GameCacheManager.toMem(game);
+        uint256 currentIndex = g.playerTurnIndex;
+        WhotCard callCard = g.callCard;
 
-        emit MoveExecuted(gameID, currentIndex, card, WhotLib.Action.Play);
+        PlayerData memory player = game.players[currentIndex];
+        if (player.pAction.not_eqs(PendingAction.None)) {
+            (err, errMsg) = (true, ResolvePendingAction.selector); //revert ResolvePendingAction();
+            return (err, errMsg);
+        }
+
+        // iWishCard has desired card shape in the body.
+        // while the number is in the upper part.
+        if (!callCard.matchWhot(card)) {
+            (err, errMsg) = (true, WrongWhotCard.selector); //revert WrongWhotCard();
+            return (err, errMsg);
+        }
+
+        if (card.generalMarket()) {
+            game.dealGeneralMarket(currentIndex);
+
+            emit GeneralMarket(gameID, currentIndex);
+        }
+        uint256 _nextIndex = game.nextIndex(currentIndex);
+        if (card.pickTwo()) {
+            bool hsm = _hasSpecialMoves(gameID, game, currentIndex, extraData);
+            PendingAction pAction =
+                card.pickFour() && hsm ? PendingAction.PickFour : PendingAction.PickTwo;
+
+            game.players[_nextIndex].pAction = pAction;
+
+            emit PlayerPickTwo(gameID, _nextIndex, pAction);
+        }
+
+        if (card.pickThree()) {
+            game.players[_nextIndex].pAction = PendingAction.PickThree;
+
+            emit PlayerPickThree(gameID, _nextIndex);
+        }
+
+        bool hold;
+        bool suspension;
+        if (card.holdOn()) hold = true;
+        if (card.suspension()) suspension = true;
+        g.lastMoveTimestamp = uint40(block.timestamp);
+        g.callCard = card;
+
+        if (hold) {
+            g.playerTurnIndex = uint8(game.nextNextIndex(currentIndex));
+            g.toStorage(slot);
+            emit PlayerSuspended(gameID, _nextIndex);
+        } else if (suspension) {
+            g.toStorage(slot);
+            emit GameSuspended(gameID, currentIndex);
+        } else {
+            g.playerTurnIndex = uint8(_nextIndex);
+            g.toStorage(slot);
+        }
+
+        emit MoveExecuted(gameID, currentIndex, Action.Play);
     }
 
     // pick 2, pick 4
-    function pick(uint256 gameID, WhotLib.GameData storage game) internal {
-        WhotLib.PlayerData[] memory players = game.players;
-        uint8 currentIndex = game.playerTurnIndex;
-        
-        if(players[currentIndex].pAction == WhotLib.PendingAction.None){ revert NoPendingAction(); }
-        for(uint8 i = 0; i < uint8(players[currentIndex].pAction) * 2; i++){
-            // can only pick if market deck is not empty.
-            if(!game.marketDeck.isEmpty()){
-                game.marketDeck.deal(game.players[currentIndex].deck);
-            }
-        }
-        game.playerTurnIndex = nextIndex(game);
+    function pick(uint256 gameID, GameData storage game, uint256 currentIndex) internal {
+        (GameCache memory g, uint256 slot) = GameCacheManager.toMem(game);
 
-        emit MoveExecuted(gameID, currentIndex, 0, WhotLib.Action.Pick);
+        PlayerData memory player = game.players[currentIndex];
+
+        if (player.pAction.eqs(PendingAction.None)) revert NoPendingAction();
+
+        if (player.pAction.eqs(PendingAction.PickTwo)) {
+            game.dealPickTwo(player, currentIndex);
+        } else if (player.pAction.eqs(PendingAction.PickThree)) {
+            game.dealPickThree(player, currentIndex);
+        } else {
+            game.dealPickFour(player, currentIndex);
+        }
+
+        emit PendingActionFulfilled(gameID, currentIndex, player.pAction);
+
+        game.players[currentIndex].pAction = PendingAction.None;
+        g.playerTurnIndex = uint8(game.nextIndex(currentIndex));
+        g.lastMoveTimestamp = uint40(block.timestamp);
+        g.toStorage(slot);
+
+        emit MoveExecuted(gameID, currentIndex, Action.Pick);
     }
 
     // defend against pick 2 or pick 4.
-    function defend(uint256 gameID, WhotLib.GameData storage game, uint256 cardIndex) internal {
-        WhotLib.PlayerData[] memory players = game.players;
-        uint8 currentIndex = game.playerTurnIndex;
-        uint8 card = players[currentIndex].deck[cardIndex].decrypt();
-        uint8 callCard = game.callCard;
-        // Defense not enabled.
-        if(!specialMovesUnlocked()) revert DefenseNotEnabled();
-        // Nothing to defend against.
-        if(players[currentIndex].pAction == WhotLib.PendingAction.None){ revert NoPendingAction(); }
-        // In order to defend, card number must be 2.
-        if(card.number() != 2 && callCard.number() != 2){
-            revert WrongWhotCard();
-        }
-        // pick 2 if pending action is a pick 4
-        if(players[currentIndex].pAction == WhotLib.PendingAction.PickFour){
-            for(uint8 i = 0; i < 2; i++){
-                game.marketDeck.deal(game.players[currentIndex].deck);
-            }
-        }
-        uint256 pDeckLength = players[currentIndex].deck.length;
-        pDeckLength--;
-        if(pDeckLength == cardIndex){
-            game.players[currentIndex].deck.pop();
-        } else {
-            game.players[currentIndex].deck[cardIndex] = players[currentIndex].deck[pDeckLength];
-            game.players[currentIndex].deck.pop();
-        }
-        game.playerTurnIndex = nextIndex(game);
-        game.callCard = card;
+    function defend(uint256 gameID, GameData storage game, WhotCard card, bytes memory extraData)
+        internal
+        returns (bool err, bytes4 errMsg)
+    {
+        (GameCache memory g, uint256 slot) = GameCacheManager.toMem(game);
+        uint256 currentIndex = g.playerTurnIndex;
 
-        emit MoveExecuted(gameID, currentIndex, card, WhotLib.Action.Defend);
+        PlayerData memory player = game.players[currentIndex];
+
+        if (!_hasSpecialMoves(gameID, game, currentIndex, extraData)) {
+            (err, errMsg) = (true, DefenseNotEnabled.selector); //revert DefenseNotEnabled();
+            return (err, errMsg);
+        }
+        // Nothing to defend against.
+        if (player.pAction.eqs(PendingAction.None)) {
+            (err, errMsg) = (true, NoPendingAction.selector); //revert NoPendingAction();
+            return (err, errMsg);
+        }
+        // In order to defend, card number must be 2.
+        if (!g.callCard.matchNumber(card)) {
+            (err, errMsg) = (true, WrongWhotCard.selector); //revert WrongWhotCard();
+            return (err, errMsg);
+        }
+
+        // pick 2 if pending action is a pick 4
+        if (player.pAction.eqs(PendingAction.PickFour)) {
+            game.dealPickTwo(player, currentIndex);
+        }
+
+        game.players[currentIndex].pAction = PendingAction.None;
+        g.playerTurnIndex = uint8(game.nextIndex(currentIndex));
+        g.lastMoveTimestamp = uint40(block.timestamp);
+        g.callCard = card;
+        g.toStorage(slot);
+
+        emit MoveExecuted(gameID, currentIndex, Action.Defend);
     }
 
     // Go to Market. Take a card from the market deck.
-    function goToMarket(uint256 gameID, WhotLib.GameData storage game) internal {
-        WhotLib.PlayerData[] memory players = game.players;
-        uint8 currentIndex = game.playerTurnIndex;
-        
-        if(players[currentIndex].pAction != WhotLib.PendingAction.None){
+    function goToMarket(uint256 gameID, GameData storage game, uint256 currentIndex) internal {
+        (GameCache memory g, uint256 slot) = GameCacheManager.toMem(game);
+
+        PlayerData memory player = game.players[currentIndex];
+
+        if (!player.pAction.eqs(PendingAction.None)) {
             revert ResolvePendingAction();
         }
-        game.marketDeck.deal(game.players[currentIndex].deck);
-        game.playerTurnIndex = nextIndex(game);
 
-        emit MoveExecuted(gameID, currentIndex, 0, WhotLib.Action.GoToMarket);
+        game.deal(player, currentIndex);
+        g.playerTurnIndex = uint8(game.nextIndex(currentIndex));
+        g.lastMoveTimestamp = uint40(block.timestamp);
+        g.toStorage(slot);
+
+        emit MoveExecuted(gameID, currentIndex, Action.GoToMarket);
     }
 
-    function whotCardShape() internal pure returns(WhotLib.Shape shape){
-        return WhotLib.Shape(5);
-    }
-
-    // Get next player turn index. if next player is not active skip to next player.
-    function nextIndex(WhotLib.GameData storage game) internal view returns(uint8){
-        uint8 currentIndex = game.playerTurnIndex;
-        uint8 total = uint8(game.players.length);
-        uint8 _nextIndex = (currentIndex % total) + 1;
-        while(!game.isActive[game.players[_nextIndex].playerAddr]){
-            _nextIndex = (_nextIndex % total) + 1;
-        }
-        return _nextIndex;
-    }
-    
-    // Suspends next player. Next player will miss their turn.
-    function suspend(uint256 gameID, WhotLib.GameData storage game) internal {
-        uint8 currentIndex = game.playerTurnIndex;
-        uint8 total = uint8(game.players.length);
-        uint8 _nextIndex = (currentIndex % total) + 1;
-        uint8 nextNextIndex = (_nextIndex % total) + 1;
-        while(!game.isActive[game.players[nextNextIndex].playerAddr]){
-            nextNextIndex = (nextNextIndex % total) + 1;
-        }
-        game.playerTurnIndex = nextNextIndex;
-        
-        emit Suspended(gameID, nextNextIndex);
-    }
-
-    function unlockSpecialMoves() external {
-        specialMovesUnlockedFor[msg.sender] = true;
-    }
-
-    // Shuffle player index before game starts.
-    function shufflePlayers(WhotLib.GameData storage game) internal {
-        // get random number.
-        uint256 rand = uint256(
-            keccak256(
-                abi.encode(
-                    game.gameCreator, 
-                    block.timestamp, 
-                    blockhash(block.number - 1)
-                )
-            )
-        );
-        uint256 lastIndex = game.players.length;
-        uint256 randIndex;
-        while(lastIndex > 0){
-            randIndex = rand % lastIndex;
-            WhotLib.PlayerData memory temp = game.players[lastIndex];
-            game.players[lastIndex] = game.players[randIndex];
-            game.playerIndex[game.players[randIndex].playerAddr] = lastIndex;
-            game.players[randIndex] = temp;
-            game.playerIndex[temp.playerAddr] = randIndex;
-            lastIndex--;
-        }
-    }
-
-    // Get decrypted player card.
-    function getPlayerCard(
+    function _calculatePlayersScore(
         uint256 gameID,
-        uint256 cardIndex,
-        bytes32 publicKey, 
-        bytes calldata signature
-    ) public view onlySignedPublicKey(publicKey, signature) returns (bytes memory) {
-        WhotLib.GameData storage game = whotGame[gameID];
-        WhotLib.PlayerData memory player = game.players[game.playerIndex[msg.sender]];
-        if(msg.sender != player.playerAddr){
-            revert PlayerNotInGame();
+        GameData storage game,
+        PlayerData[] memory players,
+        uint256 activePlayers
+    ) internal {
+        uint256[] memory playerIndexes = new uint256[](activePlayers);
+        euint128 totals;
+        uint256 indexPtr;
+        for (uint256 i; i < players.length; i++) {
+            if (players[i].isActive) {
+                totals = totals.add(game.calculatePlayerScore(i).shl(uint8(i * 16)));
+                playerIndexes[indexPtr++] = i;
+            }
         }
-        euint8 card = player.deck[cardIndex];
-        return card.reencrypt(publicKey);
+        _commitScore(gameID, totals, playerIndexes);
     }
 
-    function gameStarted(WhotLib.GameData storage game) internal view returns(bool){
-        return game.started && !game.ended;
+    function _hasSpecialMoves(
+        uint256 gameID,
+        GameData storage game,
+        uint256 currentIndex,
+        bytes memory extraData
+    ) internal view returns (bool) {
+        IWhotManager gameCreator = IWhotManager(game.gameCreator);
+        return gameCreator.isWhotManager()
+            ? gameCreator.hasSpecialMoves(gameID, currentIndex, extraData)
+            : false;
     }
 
-    function specialMovesUnlocked() internal view returns(bool){
-        return specialMovesUnlockedFor[msg.sender];
+    function getPlayerWhotCardDeck(uint256 gameID, uint256 playerIndex)
+        public
+        view
+        returns (WhotDeckMap, euint256[2] memory)
+    {
+        PlayerData memory player = whotGame[gameID].players[playerIndex];
+        return (player.deckMap, player.whotCardDeck);
     }
 
-    function isPlayerTurn(WhotLib.GameData storage game) internal view {
-        WhotLib.PlayerData memory player = game.players[game.playerTurnIndex];
-        if(msg.sender != player.playerAddr){
-            revert NotPlayerTurn();
+    // function getPlayerWhotCardDeck(uint256 gameID)
+    //     external
+    //     view
+    //     returns (WhotDeckMap, euint256[2] memory)
+    // {
+    //     uint256 playerIndex = whotGame[gameID].playerIndex[msg.sender];
+    //     return getPlayerWhotCardDeck(gameID, playerIndex);
+    // }
+
+    function getPlayerData(uint256 gameID, uint256 playerIndex)
+        external
+        view
+        returns (PlayerData memory)
+    {
+        return whotGame[gameID].players[playerIndex];
+    }
+
+    function _onJoinGame(
+        uint256 gameID,
+        address gameCreator,
+        address player,
+        bytes memory extraData
+    ) internal {
+        if (IWhotManager(gameCreator).isWhotManager()) {
+            IWhotManager(gameCreator).onJoinGame(gameID, player, extraData);
         }
     }
 
-    constructor() EIP712WithModifier("Whot Authorization Token", "0.1"){}
+    function _onExecuteMove(uint256 gameID, address gameCreator, uint256 playerIndex, Action action)
+        internal
+    {
+        if (IWhotManager(gameCreator).isWhotManager()) {
+            IWhotManager(gameCreator).onExecuteMove(gameID, playerIndex, action);
+        }
+    }
+
+    function _onEndGame(uint256 gameID, address gameCreator) internal {
+        if (IWhotManager(gameCreator).isWhotManager()) {
+            IWhotManager(gameCreator).onEndGame(gameID);
+        }
+    }
 }

@@ -1,18 +1,25 @@
-import type { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/dist/src/signer-with-address";
+import { ACCOUNT_NAMES } from "./constants";
+import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
+import { ethers } from "hardhat";
+
+export type AccountNames = (typeof ACCOUNT_NAMES)[number];
 
 export interface Signers {
-  alice: SignerWithAddress;
-  bob: SignerWithAddress;
-  carol: SignerWithAddress;
-  dave: SignerWithAddress;
+  [K in AccountNames]: HardhatEthersSigner;
 }
 
-export const getSigners = async (ethers: any): Promise<Signers> => {
-  const signers = await ethers.getSigners();
-  return {
-    alice: signers[0],
-    bob: signers[1],
-    carol: signers[2],
-    dave: signers[3],
-  };
+const signers: Signers = {} as Signers;
+
+export const initSigners = async (): Promise<void> => {
+  if (Object.entries(signers).length === 0) {
+    const eSigners = await ethers.getSigners();
+    for (let index = 0; index < ACCOUNT_NAMES.length; index++) {
+      const name = ACCOUNT_NAMES[index];
+      signers[name] = eSigners[index];
+    }
+  }
+};
+
+export const getSigners = async (): Promise<Signers> => {
+  return signers;
 };

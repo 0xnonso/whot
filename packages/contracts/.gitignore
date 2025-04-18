@@ -1,7 +1,7 @@
 # Compiler files
 cache/
 artifacts/
-types/
+/types
 build/
 out/
 
@@ -12,6 +12,7 @@ out/
 
 # Docs
 docs/
+*.txt
 
 # Dotenv file
 .env
